@@ -1,16 +1,15 @@
 """
 MNIST 3D Manifold 시각화
 - 병목 레이어(3노드)를 통해 10개 클래스가 3차원 공간에 어떻게 매핑되는지 시각화
+- 모델: Keras Functional API
 """
 
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import DataLoader
-from torchvision import datasets, transforms
-import plotly.graph_objects as go
 import numpy as np
 import os
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers
+import plotly.graph_objects as go
 
 # ─────────────────────────────────────────
 # 1. 하이퍼파라미터 및 설정
@@ -20,142 +19,82 @@ EPOCHS       = 15
 LR           = 1e-3
 BOTTLENECK   = 3       # 3D manifold 병목 노드 수
 VIZ_SAMPLES  = 5000   # 시각화에 사용할 테스트 샘플 수
-DATA_DIR     = "./data"
 OUTPUT_HTML  = "mnist_manifold_3d.html"
+MODEL_PATH   = "best_model.keras"
 
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"사용 디바이스: {DEVICE}")
+print(f"TensorFlow 버전: {tf.__version__}")
+print(f"GPU 사용 가능: {len(tf.config.list_physical_devices('GPU')) > 0}")
 
 
 # ─────────────────────────────────────────
 # 2. 데이터 로드
 # ─────────────────────────────────────────
-def get_dataloaders():
-    """MNIST 데이터셋을 로드하고 DataLoader 반환"""
-    transform = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize((0.1307,), (0.3081,))  # MNIST 평균/표준편차
-    ])
+def get_datasets():
+    """MNIST 데이터셋을 로드하고 전처리하여 반환"""
+    (x_train, y_train), (x_test, y_test) = keras.datasets.mnist.load_data()
 
-    train_dataset = datasets.MNIST(DATA_DIR, train=True,  download=True, transform=transform)
-    test_dataset  = datasets.MNIST(DATA_DIR, train=False, download=True, transform=transform)
+    # 정규화 (MNIST 평균/표준편차 적용) 및 평탄화: (N, 28, 28) → (N, 784)
+    mean, std = 0.1307, 0.3081
+    x_train = (x_train.reshape(-1, 784).astype("float32") / 255.0 - mean) / std
+    x_test  = (x_test.reshape(-1, 784).astype("float32") / 255.0 - mean) / std
 
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True,  num_workers=2, pin_memory=True)
-    test_loader  = DataLoader(test_dataset,  batch_size=BATCH_SIZE, shuffle=False, num_workers=2, pin_memory=True)
-
-    print(f"학습 샘플: {len(train_dataset):,}  /  테스트 샘플: {len(test_dataset):,}")
-    return train_loader, test_loader
+    print(f"학습 샘플: {len(x_train):,}  /  테스트 샘플: {len(x_test):,}")
+    return (x_train, y_train), (x_test, y_test)
 
 
 # ─────────────────────────────────────────
-# 3. 모델 정의
+# 3. 모델 정의 (Keras Functional API)
 # ─────────────────────────────────────────
-class MNISTManifoldNet(nn.Module):
+def build_model(bottleneck_dim=3):
     """
     병목 레이어(3노드)를 포함한 MNIST 분류 네트워크.
 
     구조: 784 → 512 → 256 → 128 → [3] → 10
                                     ↑
                               3D manifold 병목
+    반환: (전체 분류 모델, 병목 출력 추출용 서브모델)
     """
-    def __init__(self, bottleneck_dim=3):
-        super().__init__()
+    inputs = keras.Input(shape=(784,), name="input")
 
-        # 인코더: 입력 → 3차원 병목
-        self.encoder = nn.Sequential(
-            nn.Linear(784, 512),
-            nn.BatchNorm1d(512),
-            nn.ReLU(),
+    # 인코더: 입력 → 3차원 병목
+    x = layers.Dense(512)(inputs)
+    x = layers.BatchNormalization()(x)
+    x = layers.ReLU()(x)
 
-            nn.Linear(512, 256),
-            nn.BatchNorm1d(256),
-            nn.ReLU(),
+    x = layers.Dense(256)(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.ReLU()(x)
 
-            nn.Linear(256, 128),
-            nn.BatchNorm1d(128),
-            nn.ReLU(),
+    x = layers.Dense(128)(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.ReLU()(x)
 
-            nn.Linear(128, bottleneck_dim),  # ← 3D 병목 레이어
-        )
+    bottleneck = layers.Dense(bottleneck_dim, name="bottleneck")(x)  # ← 3D 병목 레이어
 
-        # 분류기: 3차원 표현 → 10개 클래스
-        self.classifier = nn.Linear(bottleneck_dim, 10)
+    # 분류기: 3차원 표현 → 10개 클래스
+    outputs = layers.Dense(10, activation="softmax", name="classifier")(bottleneck)
 
-    def forward(self, x):
-        x = x.view(x.size(0), -1)       # (N, 1, 28, 28) → (N, 784) 평탄화
-        features = self.encoder(x)       # (N, 3) — 3D manifold 좌표
-        logits   = self.classifier(features)  # (N, 10) — 클래스 점수
-        return logits, features
+    # 전체 모델 (학습용)
+    model = keras.Model(inputs=inputs, outputs=outputs, name="MNISTManifoldNet")
 
+    # 병목 출력 추출용 서브모델 (특징 시각화용)
+    feature_model = keras.Model(inputs=inputs, outputs=bottleneck, name="FeatureExtractor")
 
-# ─────────────────────────────────────────
-# 4. 학습 루프
-# ─────────────────────────────────────────
-def train_one_epoch(model, loader, optimizer, criterion):
-    """한 에폭 학습 수행"""
-    model.train()
-    total_loss, correct, total = 0.0, 0, 0
-
-    for images, labels in loader:
-        images, labels = images.to(DEVICE), labels.to(DEVICE)
-
-        optimizer.zero_grad()
-        logits, _ = model(images)
-        loss = criterion(logits, labels)
-        loss.backward()
-        optimizer.step()
-
-        total_loss += loss.item() * images.size(0)
-        correct    += (logits.argmax(dim=1) == labels).sum().item()
-        total      += images.size(0)
-
-    return total_loss / total, correct / total
-
-
-def evaluate(model, loader, criterion):
-    """테스트셋 평가"""
-    model.eval()
-    total_loss, correct, total = 0.0, 0, 0
-
-    with torch.no_grad():
-        for images, labels in loader:
-            images, labels = images.to(DEVICE), labels.to(DEVICE)
-            logits, _ = model(images)
-            loss = criterion(logits, labels)
-
-            total_loss += loss.item() * images.size(0)
-            correct    += (logits.argmax(dim=1) == labels).sum().item()
-            total      += images.size(0)
-
-    return total_loss / total, correct / total
+    return model, feature_model
 
 
 # ─────────────────────────────────────────
-# 5. 3D 특징 추출
+# 4. 3D 특징 추출
 # ─────────────────────────────────────────
-def extract_features(model, loader, max_samples=5000):
+def extract_features(feature_model, x_test, y_test, max_samples=5000):
     """
     병목 레이어(3노드)의 출력을 추출.
     반환: features (N, 3), labels (N,)
     """
-    model.eval()
-    all_features, all_labels = [], []
+    features = feature_model.predict(x_test[:max_samples], batch_size=BATCH_SIZE, verbose=0)
+    labels   = y_test[:max_samples]
 
-    with torch.no_grad():
-        for images, labels in loader:
-            images = images.to(DEVICE)
-            _, features = model(images)
-            all_features.append(features.cpu().numpy())
-            all_labels.append(labels.numpy())
-
-            # 최대 샘플 수 초과 시 중단
-            if sum(len(f) for f in all_features) >= max_samples:
-                break
-
-    features = np.concatenate(all_features, axis=0)[:max_samples]
-    labels   = np.concatenate(all_labels,   axis=0)[:max_samples]
-
-    # ✅ 검증 포인트 1: shape 확인
+    # 검증: shape 확인
     assert features.shape[1] == 3, f"병목 출력 shape 오류: {features.shape}"
     print(f"추출된 특징 shape: {features.shape}  (기대값: ({max_samples}, 3))")
 
@@ -163,14 +102,13 @@ def extract_features(model, loader, max_samples=5000):
 
 
 # ─────────────────────────────────────────
-# 6. 인터랙티브 3D 시각화 (Plotly)
+# 5. 인터랙티브 3D 시각화 (Plotly)
 # ─────────────────────────────────────────
 def visualize_3d_manifold(features, labels, accuracy, output_path):
     """
     10개 클래스의 3D 분포를 인터랙티브 산점도로 시각화.
     마우스로 회전/줌/호버 가능.
     """
-    # 클래스별 색상 팔레트 (선명하게 구분)
     COLORS = [
         "#E74C3C",  # 0 — 빨강
         "#3498DB",  # 1 — 파랑
@@ -188,12 +126,10 @@ def visualize_3d_manifold(features, labels, accuracy, output_path):
 
     for digit in range(10):
         mask = labels == digit
-        x = features[mask, 0]
-        y = features[mask, 1]
-        z = features[mask, 2]
-
         fig.add_trace(go.Scatter3d(
-            x=x, y=y, z=z,
+            x=features[mask, 0],
+            y=features[mask, 1],
+            z=features[mask, 2],
             mode="markers",
             name=f"숫자 {digit}",
             marker=dict(
@@ -238,7 +174,6 @@ def visualize_3d_manifold(features, labels, accuracy, output_path):
         paper_bgcolor="white",
     )
 
-    # HTML로 저장 (브라우저에서 인터랙티브하게 열기 가능)
     fig.write_html(output_path, include_plotlyjs="cdn")
     print(f"\n✅ 인터랙티브 3D 그래프 저장 완료: {output_path}")
     print("   → 브라우저에서 파일을 열면 마우스로 회전/줌/호버 가능합니다.")
@@ -247,7 +182,7 @@ def visualize_3d_manifold(features, labels, accuracy, output_path):
 
 
 # ─────────────────────────────────────────
-# 7. 메인 실행
+# 6. 메인 실행
 # ─────────────────────────────────────────
 def main():
     print("=" * 55)
@@ -255,46 +190,63 @@ def main():
     print("=" * 55)
 
     # 데이터 로드
-    train_loader, test_loader = get_dataloaders()
+    (x_train, y_train), (x_test, y_test) = get_datasets()
 
-    # 모델 / 손실함수 / 옵티마이저 초기화
-    model     = MNISTManifoldNet(bottleneck_dim=BOTTLENECK).to(DEVICE)
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=LR)
-    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.5)
+    # 모델 빌드
+    model, feature_model = build_model(bottleneck_dim=BOTTLENECK)
 
-    total_params = sum(p.numel() for p in model.parameters())
+    total_params = model.count_params()
     print(f"\n모델 파라미터 수: {total_params:,}")
     print(f"병목 레이어 차원: {BOTTLENECK}D\n")
+    model.summary()
 
-    # ── 학습 루프 ──
-    print(f"{'에폭':>5} | {'학습 손실':>10} | {'학습 정확도':>10} | {'테스트 손실':>11} | {'테스트 정확도':>12}")
-    print("-" * 60)
+    # 컴파일
+    model.compile(
+        optimizer=keras.optimizers.Adam(learning_rate=LR),
+        loss="sparse_categorical_crossentropy",
+        metrics=["accuracy"],
+    )
 
-    best_acc = 0.0
-    for epoch in range(1, EPOCHS + 1):
-        train_loss, train_acc = train_one_epoch(model, train_loader, optimizer, criterion)
-        test_loss,  test_acc  = evaluate(model, test_loader, criterion)
-        scheduler.step()
+    # 콜백: 최적 모델 저장 + 학습률 스케줄
+    callbacks = [
+        keras.callbacks.ModelCheckpoint(
+            MODEL_PATH,
+            monitor="val_accuracy",
+            save_best_only=True,
+            verbose=1,
+        ),
+        keras.callbacks.ReduceLROnPlateau(
+            monitor="val_loss",
+            factor=0.5,
+            patience=3,
+            verbose=1,
+        ),
+    ]
 
-        print(f"{epoch:>5} | {train_loss:>10.4f} | {train_acc*100:>9.2f}% | {test_loss:>11.4f} | {test_acc*100:>11.2f}%")
+    # 학습
+    print(f"\n{'─'*55}")
+    history = model.fit(
+        x_train, y_train,
+        batch_size=BATCH_SIZE,
+        epochs=EPOCHS,
+        validation_data=(x_test, y_test),
+        callbacks=callbacks,
+        verbose=1,
+    )
 
-        if test_acc > best_acc:
-            best_acc = test_acc
-            torch.save(model.state_dict(), "best_model.pt")
+    # 최적 모델 로드 후 최종 평가
+    model.load_weights(MODEL_PATH)
+    _, best_acc = model.evaluate(x_test, y_test, batch_size=BATCH_SIZE, verbose=0)
 
     print(f"\n✅ 학습 완료 — 최고 테스트 정확도: {best_acc*100:.2f}%")
-
-    # ✅ 검증 포인트 2: 정확도 출력
     print(f"   (3노드 병목 제약에도 불구하고 {best_acc*100:.1f}% 달성)")
 
-    # 최적 모델 로드 후 특징 추출
-    model.load_state_dict(torch.load("best_model.pt", map_location=DEVICE))
-
+    # 병목 레이어 특징 추출
     print(f"\n병목 레이어 3D 특징 추출 중 ({VIZ_SAMPLES:,}개 샘플)...")
-    features, labels = extract_features(model, test_loader, max_samples=VIZ_SAMPLES)
+    # feature_model도 동일한 가중치를 공유하므로 별도 로드 불필요
+    features, labels = extract_features(feature_model, x_test, y_test, max_samples=VIZ_SAMPLES)
 
-    # ✅ 검증 포인트 3: 클래스별 분포 확인
+    # 클래스별 분포 확인
     print("\n클래스별 샘플 수:")
     for d in range(10):
         print(f"  숫자 {d}: {(labels == d).sum():>5}개")
